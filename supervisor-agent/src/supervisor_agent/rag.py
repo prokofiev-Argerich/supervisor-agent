@@ -37,20 +37,45 @@ def get_collection(persist_dir: Optional[str] = None):
     )
 
 
-def query_similar(query_text: str, n_results: int = 5, persist_dir: Optional[str] = None) -> list[str]:
+def query_similar(
+    query_text: str,
+    n_results: int = 5,
+    persist_dir: Optional[str] = None,
+    *,
+    with_metadata: bool = False,
+) -> list[str] | list[dict]:
     """Query ChromaDB for the top-K most similar LaTeX chunks.
 
-    Returns a list of document strings. If the collection is empty or
-    ChromaDB is unavailable, returns an empty list with a warning.
+    Args:
+        query_text: The text to search for.
+        n_results: Maximum number of results.
+        persist_dir: Optional custom ChromaDB directory.
+        with_metadata: If True, return list[dict] with keys ``text`` and
+            ``metadata`` instead of plain strings.
+
+    Returns:
+        A list of document strings (default) or dicts when *with_metadata*
+        is True.  Returns an empty list on error or empty collection.
     """
     try:
         col = get_collection(persist_dir)
         if col.count() == 0:
             logger.warning("ChromaDB collection is empty — skipping retrieval.")
             return []
-        results = col.query(query_texts=[query_text], n_results=min(n_results, col.count()))
+        results = col.query(
+            query_texts=[query_text],
+            n_results=min(n_results, col.count()),
+            include=["documents", "metadatas"],
+        )
         docs = results.get("documents", [[]])[0]
+        metas = results.get("metadatas", [[]])[0]
         logger.info(f"RAG retrieved {len(docs)} chunks for query: {query_text[:80]}...")
+
+        if with_metadata:
+            return [
+                {"text": doc, "metadata": meta or {}}
+                for doc, meta in zip(docs, metas)
+            ]
         return docs
     except Exception as e:
         logger.error(f"RAG query failed: {e}")
