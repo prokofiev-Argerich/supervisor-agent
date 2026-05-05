@@ -13,6 +13,10 @@ venv/
 # ChromaDB
 chroma_db/
 
+# Generated paper artifacts
+artifacts/
+supervisor-agent/artifacts/
+
 # Node
 node_modules/
 .next/

@@ -1,9 +1,9 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useEffect, useState, useRef } from "react";
 import { motion } from "framer-motion";
 import ReactMarkdown from "react-markdown";
-import { Sparkles, BookOpen, Circle, Loader2, Check, RefreshCw, ChevronRight, MessageSquare } from "lucide-react";
+import { Sparkles, BookOpen, Circle, Loader2, Check, RefreshCw, ChevronRight, MessageSquare, Download } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -12,9 +12,20 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { Badge } from "@/components/ui/badge";
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
 type Phase = "idle" | "outlining" | "outline_ready" | "revising" | "writing" | "done";
+
+type ArtifactItem = {
+  task_id: string;
+  topic?: string;
+  word_count?: number;
+  keywords?: string[];
+  created_at?: string;
+  status?: string;
+  download_url?: string;
+  content_url?: string;
+};
 
 const STATUS_STEPS = [
   { label: "规划大纲中", key: "outline" },
@@ -68,72 +79,83 @@ export default function Home() {
   const abortRef = useRef<AbortController | null>(null);
   const [feedback, setFeedback] = useState("");
   const [maxRevisions, setMaxRevisions] = useState(2);
+  const [keywordsText, setKeywordsText] = useState("");
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [taskId, setTaskId] = useState<string | null>(null);
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  const [artifacts, setArtifacts] = useState<ArtifactItem[]>([]);
+  const [isLoadingArtifacts, setIsLoadingArtifacts] = useState(false);
 
   const busy = phase === "outlining" || phase === "writing" || phase === "revising";
+
+  function parseKeywords(input: string): string[] {
+    return input
+      .split(/[,，\n]/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
+  function downloadArtifact(url: string) {
+    const link = document.createElement("a");
+    link.href = `${API_BASE}${url}`;
+    link.download = "final_paper.md";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
+  async function loadArtifacts() {
+    setIsLoadingArtifacts(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/artifacts`);
+      if (!res.ok) throw new Error("加载历史记录失败");
+      const data = (await res.json()) as ArtifactItem[];
+      setArtifacts(data);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsLoadingArtifacts(false);
+    }
+  }
+
+  async function openArtifact(taskId: string) {
+    if (busy) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/artifacts/${taskId}/content`);
+      if (!res.ok) throw new Error("加载论文内容失败");
+      const data = (await res.json()) as { task_id: string; text: string };
+      setMarkdown(data.text);
+      setOutlineMd("");
+      setTaskId(data.task_id);
+      setDownloadUrl(`/api/artifacts/${data.task_id}/download`);
+      setErrorMessage(null);
+      setPhase("done");
+      setActiveStep(3);
+    } catch (err: unknown) {
+      console.error(err);
+      if (err instanceof Error) setErrorMessage(err.message);
+    }
+  }
+
+  useEffect(() => {
+    void loadArtifacts();
+  }, []);
 
   // ── Phase 1: generate outline ──
   const handleGenerateOutline = async () => {
     if (!topic.trim() || topic.trim().length > 1000 || !wordLimit || busy) return;
-    setOutlineMd(""); setSections([]); setMarkdown(""); setFeedback("");
+    setOutlineMd(""); setSections([]); setMarkdown(""); setFeedback(""); setErrorMessage(null);
     setPhase("outlining"); setActiveStep(0);
     const ctrl = new AbortController(); abortRef.current = ctrl;
     try {
       const res = await fetch(`${API_BASE}/api/generate_outline`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ topic: topic.trim(), word_count: wordLimit, language: "zh" }),
-        signal: ctrl.signal,
-      });
-      if (!res.ok || !res.body) throw new Error(`请求失败 (${res.status})`);
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder("utf-8");
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith("data: ")) continue;
-          const payload = trimmed.slice(6);
-          if (payload === "[DONE]") break;
-          try {
-            const data = JSON.parse(payload);
-            if (data.type === "status") setActiveStep(data.step as number);
-            else if (data.type === "content") setOutlineMd((p) => p + (data.text as string));
-            else if (data.type === "outline_done") {
-              setOutlineMd(data.outline as string);
-              setSections(data.sections as string[]);
-            }
-          } catch { /* 粘包导致的不完整 JSON，跳过 */ }
-        }
-      }
-
-      setPhase("outline_ready"); setActiveStep(1);
-    } catch (err: unknown) {
-      if (err instanceof Error && err.name !== "AbortError") console.error(err);
-      if (phase !== "outline_ready") setPhase("idle");
-    } finally { abortRef.current = null; }
-  };
-
-  // ── Phase 1.5: revise outline ──
-  const handleReviseOutline = async () => {
-    if (!feedback.trim() || busy) return;
-    const currentOutline = outlineMd;
-    const currentSections = [...sections];
-    setOutlineMd(""); setPhase("revising"); setActiveStep(0);
-    const ctrl = new AbortController(); abortRef.current = ctrl;
-    try {
-      const res = await fetch(`${API_BASE}/api/revise_outline`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          topic: topic.trim(), word_count: wordLimit, language: "zh",
-          outline: currentOutline, sections: currentSections, feedback: feedback.trim(),
+          topic: topic.trim(),
+          word_count: wordLimit,
+          language: "zh",
+          keywords: parseKeywords(keywordsText),
         }),
         signal: ctrl.signal,
       });
@@ -161,6 +183,67 @@ export default function Home() {
             else if (data.type === "outline_done") {
               setOutlineMd(data.outline as string);
               setSections(data.sections as string[]);
+            } else if (data.type === "error") {
+              setErrorMessage(data.message as string);
+            }
+          } catch { /* 粘包导致的不完整 JSON，跳过 */ }
+        }
+      }
+
+      setPhase("outline_ready"); setActiveStep(1);
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name !== "AbortError") {
+        console.error(err);
+        setErrorMessage(err.message);
+      }
+      if (phase !== "outline_ready") setPhase("idle");
+    } finally { abortRef.current = null; }
+  };
+
+  // ── Phase 1.5: revise outline ──
+  const handleReviseOutline = async () => {
+    if (!feedback.trim() || busy) return;
+    const currentOutline = outlineMd;
+    const currentSections = [...sections];
+    setOutlineMd(""); setPhase("revising"); setActiveStep(0); setErrorMessage(null);
+    const ctrl = new AbortController(); abortRef.current = ctrl;
+    try {
+      const res = await fetch(`${API_BASE}/api/revise_outline`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          topic: topic.trim(), word_count: wordLimit, language: "zh",
+          outline: currentOutline, sections: currentSections, feedback: feedback.trim(),
+          keywords: parseKeywords(keywordsText),
+        }),
+        signal: ctrl.signal,
+      });
+      if (!res.ok || !res.body) throw new Error(`请求失败 (${res.status})`);
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith("data: ")) continue;
+          const payload = trimmed.slice(6);
+          if (payload === "[DONE]") break;
+          try {
+            const data = JSON.parse(payload);
+            if (data.type === "status") setActiveStep(data.step as number);
+            else if (data.type === "content") setOutlineMd((p) => p + (data.text as string));
+            else if (data.type === "outline_done") {
+              setOutlineMd(data.outline as string);
+              setSections(data.sections as string[]);
+            } else if (data.type === "error") {
+              setErrorMessage(data.message as string);
             }
           } catch { /* 粘包导致的不完整 JSON，跳过 */ }
         }
@@ -168,7 +251,10 @@ export default function Home() {
 
       setPhase("outline_ready"); setActiveStep(1); setFeedback("");
     } catch (err: unknown) {
-      if (err instanceof Error && err.name !== "AbortError") console.error(err);
+      if (err instanceof Error && err.name !== "AbortError") {
+        console.error(err);
+        setErrorMessage(err.message);
+      }
       if (phase !== "outline_ready") setPhase("outline_ready");
     } finally { abortRef.current = null; }
   };
@@ -176,7 +262,8 @@ export default function Home() {
   // ── Phase 2: confirm outline & write full paper ──
   const handleConfirmAndWrite = async () => {
     if (!outlineMd || busy) return;
-    setMarkdown(""); setPhase("writing"); setActiveStep(1);
+    setMarkdown(""); setPhase("writing"); setActiveStep(1); setErrorMessage(null);
+    setTaskId(null); setDownloadUrl(null);
     const ctrl = new AbortController(); abortRef.current = ctrl;
     try {
       const res = await fetch(`${API_BASE}/api/confirm_and_write`, {
@@ -185,6 +272,7 @@ export default function Home() {
         body: JSON.stringify({
           topic: topic.trim(), word_count: wordLimit, language: "zh",
           outline: outlineMd, sections, max_revisions: maxRevisions,
+          keywords: parseKeywords(keywordsText),
         }),
         signal: ctrl.signal,
       });
@@ -219,13 +307,21 @@ export default function Home() {
             else if (data.type === "final_paper") {
               const finalText = data.text as string;
               setMarkdown(finalText.replace(/^```(markdown|md)?\s*/i, '').replace(/\s*```$/i, ''));
+              if (typeof data.task_id === "string") setTaskId(data.task_id);
+              if (typeof data.download_url === "string") setDownloadUrl(data.download_url);
+              void loadArtifacts();
+            } else if (data.type === "error") {
+              setErrorMessage(data.message as string);
             }
           } catch { /* 粘包导致的不完整 JSON，跳过 */ }
         }
       }
       setPhase("done"); setActiveStep(4);
     } catch (err: unknown) {
-      if (err instanceof Error && err.name !== "AbortError") console.error(err);
+      if (err instanceof Error && err.name !== "AbortError") {
+        console.error(err);
+        setErrorMessage(err.message);
+      }
       if (phase !== "done") setPhase("outline_ready");
     } finally { abortRef.current = null; }
   };
@@ -233,7 +329,8 @@ export default function Home() {
   const handleReset = () => {
     abortRef.current?.abort();
     setPhase("idle"); setActiveStep(-1);
-    setOutlineMd(""); setSections([]); setMarkdown(""); setFeedback("");
+    setOutlineMd(""); setSections([]); setMarkdown(""); setFeedback(""); setErrorMessage(null);
+    setTaskId(null); setDownloadUrl(null);
   };
 
   const displayMd = phase === "done" || phase === "writing" ? (markdown || "正在生成中...") :
@@ -263,7 +360,7 @@ export default function Home() {
       {/* Main Split */}
       <div className="flex flex-1 overflow-hidden">
         {/* Left Panel */}
-        <aside className="flex w-1/3 flex-col gap-6 border-r p-8">
+        <aside className="flex w-1/3 flex-col gap-6 overflow-y-auto border-r p-8">
           <Card className="border-0 shadow-none">
             <CardContent className="space-y-5 p-0">
               <Textarea
@@ -293,6 +390,23 @@ export default function Home() {
                   disabled={busy}
                 />
               </div>
+              <div className="flex items-center gap-3">
+                <label className="shrink-0 text-sm text-zinc-400">关键词，可选</label>
+                <Input
+                  type="text"
+                  value={keywordsText}
+                  onChange={(e) => setKeywordsText(e.target.value)}
+                  placeholder="用逗号分隔，如：深度学习, NLP"
+                  disabled={busy}
+                  className="flex-1 text-sm"
+                />
+              </div>
+
+              {errorMessage && (
+                <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                  {errorMessage}
+                </div>
+              )}
 
               {/* Action Buttons */}
               {phase === "idle" || phase === "outlining" ? (
@@ -346,6 +460,16 @@ export default function Home() {
                 </Button>
               )}
 
+              {downloadUrl && (
+                <Button
+                  variant="outline"
+                  className="w-full gap-2"
+                  onClick={() => downloadArtifact(downloadUrl)}
+                >
+                  <Download className="h-4 w-4" /> 下载 Markdown
+                </Button>
+              )}
+
               <Separator />
 
               {/* Status Steps */}
@@ -354,6 +478,60 @@ export default function Home() {
                 {STATUS_STEPS.map((step, i) => (
                   <PulsingBadge key={step.key} label={step.label} active={i === activeStep} done={activeStep > i || activeStep === 4} />
                 ))}
+              </div>
+
+              <Separator />
+
+              {/* History */}
+              <div className="space-y-2.5 pt-2">
+                <p className="text-xs font-medium uppercase tracking-widest text-zinc-300">历史生成</p>
+                {isLoadingArtifacts ? (
+                  <p className="text-xs text-zinc-400">加载中...</p>
+                ) : artifacts.length === 0 ? (
+                  <p className="text-xs text-zinc-400">暂无历史记录</p>
+                ) : (
+                  <div className="space-y-2">
+                    {artifacts.map((item) => (
+                      <div
+                        key={item.task_id}
+                        className="rounded-md border border-zinc-200 px-3 py-2"
+                      >
+                        <div className="truncate text-xs font-medium text-zinc-700">
+                          {item.topic || "未命名"}
+                        </div>
+                        <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-[11px] text-zinc-400">
+                          <span>
+                            {item.created_at
+                              ? new Date(item.created_at).toLocaleString()
+                              : ""}
+                          </span>
+                          {item.status && <span>· {item.status}</span>}
+                        </div>
+                        <div className="mt-2 flex gap-2">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-7 px-2 text-xs"
+                            disabled={busy}
+                            onClick={() => void openArtifact(item.task_id)}
+                          >
+                            打开
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-7 gap-1 px-2 text-xs"
+                            onClick={() =>
+                              item.download_url && downloadArtifact(item.download_url)
+                            }
+                          >
+                            <Download className="h-3 w-3" /> 下载
+                          </Button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </CardContent>
           </Card>

@@ -1,129 +1,307 @@
-# Supervisor Agent
+# supervisor_AGENT
 
-面向严肃学术长文调研与生成场景的端到端闭环 AI 系统。
+## Overview
 
-AI 负责文献检索、长文起草与格式排版；用户（Human-in-the-loop）负责全局大纲确认、修改意见反馈与核心研究方向定调。基于 FastAPI + LangGraph 构建，支持大纲生成、人工动态修订、RAG 检索增强和流式（SSE）全文撰写。
+`supervisor_AGENT` is an **Agentic RAG paper generation MVP**. It turns a topic + word budget + optional keywords into a long-form Markdown paper through a multi-node LangGraph pipeline backed by a local LaTeX knowledge base.
 
----
+It is **not** a production system, a citation manager, or a proofreading tool. It is a research-oriented MVP that demonstrates an end-to-end loop from outline to reviewed final paper, with streaming progress, source-tagged drafting, and durable per-task artifacts.
 
-## 💡 核心设计与特性
-
-### 1. 多节点状态流转编排 (LangGraph)
-弃用黑盒框架，采用 LangGraph 状态机编排执行流程，拆分为四大核心节点：
-* **Planner（规划）：** 根据用户主题生成结构化大纲，支持接收反馈并动态重构大纲。
-* **Researcher（检索）：** 基于确认后的大纲调用 RAG 检索知识库，精确召回相关文献片段。
-* **Writer（撰写）：** 携带检索上下文逐章撰写，动态滑动窗口截断历史，解决长文本 Token 爆炸与注意力涣散。
-* **Reviewer（审稿）：** 采用 Pydantic 结构化约束的审查节点，拦截虚假引用，锚定文献真实性。
-
-### 2. 人机协同工作流 (Human-in-the-loop)
-引入大纲修订循环机制。用户在生成长文前，可对 AI 生成的初始大纲提出具体的修改意见（如“第三章拆成两节”、“增加文献综述章节”），系统将结合历史大纲与反馈重新规划，直到用户满意后才触发高成本的全文撰写与检索。
-
-### 3. 代码级语义切块 (LaTeX RAG)
-创新性抛弃常规 PDF 解析，基于 LaTeX 原生标签（`\section`、`\subsection`）实现语义切块。元数据（章节层级、标题）强绑定至 ChromaDB 向量条目，检索精度远超朴素文本分割。
-
-### 4. 流式交互架构 (SSE)
-基于 FastAPI 异步路由与 SSE 单向流式通信，打造丝滑的前端打字机体验。
+The project is a monorepo: a Next.js frontend talks to a FastAPI + LangGraph backend, which orchestrates Planner → Researcher → Writer → Reviewer nodes around a ChromaDB-backed RAG layer.
 
 ---
 
-## 🏗️ 架构概览
+## Features
 
-    ┌─────────────────────────────────────────────────────────┐
-    │  Frontend (Next.js)                                     │
-    │  app/page.tsx — SSE 流式交互界面                         │
-    │                                                         │
-    │  用户流程:                                               │
-    │  输入主题 → 生成大纲 → [输入修改意见 ↔ 重新生成大纲] → 确认撰写 │
-    └────────────────────────┬────────────────────────────────┘
-                             │ HTTP + SSE
-    ┌────────────────────────▼────────────────────────────────┐
-    │  Backend (FastAPI)                                      │
-    │                                                         │
-    │  API 端点:                                               │
-    │    POST /api/generate_outline  — 初次生成大纲            │
-    │    POST /api/revise_outline    — 根据反馈修订大纲         │
-    │    POST /api/confirm_and_write — 确认大纲并执行 RAG 撰写  │
-    └────────────────────────┬────────────────────────────────┘
-                             │
-    ┌────────────────────────▼────────────────────────────────┐
-    │  Agent & LangGraph 编排层 (agent.py / graph.py)           │
-    │                                                         │
-    │  outline_graph:  Planner 规划初始大纲                     │
-    │  revise_graph:   Planner 接收 feedback 重构大纲           │
-    │  paper_graph:    Researcher → Writer → Reviewer         │
-    └─────────────────────────────────────────────────────────┘
+- **Outline generation** — produces a structured outline from `topic`, `word_count`, and optional `keywords`.
+- **Outline revision** — accepts free-text feedback and regenerates the outline before full writing.
+- **RAG retrieval** — Researcher node pulls top-k LaTeX chunks from ChromaDB, scoped per section title.
+- **LangGraph supervisor pipeline** — Planner → Researcher → Writer → Reviewer with conditional re-write routing.
+- **Section-by-section writing** — Writer drafts each section independently with a sliding-window summary of prior content.
+- **Reviewer-driven surgical rewrite** — Reviewer reads RAG evidence and emits per-section feedback; only flagged sections are rewritten, untouched sections are skipped at zero cost.
+- **Source tag traceability** — Writer is prompted to include `[source: filename]` markers when it leans on retrieved evidence; Reviewer also checks these markers.
+- **SSE streaming** — `status / content / final_paper / done` events stream live to the browser.
+- **Markdown artifacts** — every completed paper is persisted under `artifacts/{task_id}/`.
+- **Per-task download** — `task_id` based Markdown download endpoint.
+- **History list & restore** — past generations are listed in the UI; reopening a past task restores its final paper into the preview pane.
 
 ---
 
-## 📂 项目结构
+## Architecture
 
-    supervisor-agent/
-    ├── src/supervisor_agent/
-    │   ├── main.py              # FastAPI 入口，路由定义与 SSE 流生成
-    │   ├── agent.py             # SupervisorAgent，调度各个 Graph
-    │   ├── graph.py             # LangGraph 工作流图构建
-    │   ├── nodes.py             # 各节点业务逻辑（规划/修订/检索/撰写/校对）
-    │   ├── state.py             # 全局状态定义（PaperState，包含 feedback 字段）
-    │   ├── rag.py               # RAG 向量检索与 ChromaDB 交互
-    │   ├── config.py            # 环境变量与配置管理
-    │   ├── ingest_latex.py      # 知识库构建脚本（LaTeX 语义解析入库）
-    │   └── schemas/             # Pydantic 数据验证模型
-    │       ├── paper.py         # 包含 ReviseRequest 等请求模型
-    │       └── review.py        # 审稿与排版相关模型
-    ├── frontend/                # Next.js 交互前端
-    │   ├── app/page.tsx         # 主页面（主题输入/大纲预览/反馈弹窗/全文展示）
-    │   └── components/ui/       # shadcn/ui 组件库
-    └── .env.example             # 环境变量配置模板
+```mermaid
+flowchart LR
+    subgraph FE[Frontend - Next.js]
+        UI[app/page.tsx]
+    end
+
+    subgraph BE[Backend - FastAPI]
+        API[/api/* SSE endpoints/]
+        AGT[SupervisorAgent]
+    end
+
+    subgraph GR[LangGraph Pipeline]
+        P[Planner]
+        R[Researcher]
+        W[Writer]
+        RV[Reviewer]
+    end
+
+    subgraph DATA[Local Storage]
+        CH[(ChromaDB)]
+        ART[(artifacts/{task_id})]
+    end
+
+    LLM{{OpenAI-compatible LLM}}
+
+    UI -- POST + SSE --> API
+    API --> AGT
+    AGT --> P --> R --> W --> RV
+    RV -- needs revision --> W
+    RV -- approved --> AGT
+
+    R <--> CH
+    P <--> LLM
+    W <--> LLM
+    RV <--> LLM
+
+    AGT -- final_paper --> ART
+    UI -- list / open / download --> ART
+```
+
+The pipeline is driven by a typed `PaperState` that carries `topic`, `outline`, `sections`, `section_drafts`, `section_feedbacks`, RAG evidence, and revision counters. Reviewer feedback is structured (Pydantic) and indexed by `section_idx`, which is what enables the localized rewrite loop.
+
+---
+
+## Tech Stack
+
+**Frontend**
+
+- Next.js 16 (App Router)
+- React 19
+- TypeScript (strict)
+- Tailwind CSS v4
+- shadcn/ui
+- react-markdown
+- framer-motion, lucide-react
+
+**Backend**
+
+- FastAPI
+- Python 3.11+
+- LangGraph
+- LangChain (OpenAI + Chroma adapters)
+- AsyncOpenAI (OpenAI-compatible client — works with OpenAI, DeepSeek, SiliconFlow, Kimi, etc.)
+- ChromaDB (local PersistentClient)
+- pydantic / pydantic-settings
+- SSE via FastAPI `StreamingResponse`
+
+There is currently **no** SQLite, Postgres, Redis, Celery, or user system.
 
 ---
 
-## 🚀 快速开始
+## Project Structure
 
-### 1. 环境准备与配置
+```txt
+supervisor_AGENT/
+├── frontend/
+│   ├── app/page.tsx              # main UI + SSE consumer + history panel
+│   ├── components/ui/            # shadcn/ui primitives
+│   └── package.json
+│
+├── supervisor-agent/
+│   ├── src/supervisor_agent/
+│   │   ├── main.py               # FastAPI app + SSE endpoints + artifact routes
+│   │   ├── agent.py              # SupervisorAgent: state assembly + stream wiring
+│   │   ├── graph.py              # LangGraph workflow + conditional edges
+│   │   ├── nodes.py              # Planner / Researcher / Writer / Reviewer
+│   │   ├── state.py              # PaperState TypedDict
+│   │   ├── rag.py                # ChromaDB retrieval helpers
+│   │   ├── artifacts.py          # task_id, save/list/load artifact, path safety
+│   │   ├── config.py             # pydantic-settings env loader
+│   │   └── schemas/              # paper / review Pydantic models
+│   ├── ingest_latex.py           # offline LaTeX → ChromaDB ingestion script
+│   ├── requirements.txt
+│   ├── pyproject.toml
+│   └── .env.example
+│
+├── .gitignore
+├── CLAUDE.md                     # project-specific AI coding rules
+└── README.md
+```
 
-在项目根目录复制环境变量模板并填入您的配置：
-
-    cp .env.example .env
-
-**关键环境变量说明：**
-
-| 变量 | 说明 |
-| :--- | :--- |
-| `OPENAI_API_KEY` | 您的 API 密钥（必填） |
-| `OPENAI_BASE_URL` | 自定义 API 代理地址（可选，兼容 DeepSeek / Ollama 等兼容协议服务） |
-| `OPENAI_MODEL` | 使用的模型名称，默认推荐 `gpt-4-turbo-preview` |
-| `LOG_LEVEL` | 日志级别，默认 `INFO` |
-
-### 2. 启动后端 (FastAPI)
-
-建议使用 Python 3.11+ 虚拟环境：
-
-    cd supervisor-agent
-    python -m venv venv
-    source venv/bin/activate     # Windows 用户请使用: venv\Scripts\activate
-    pip install -e ".[dev]"      # 或 pip install -r requirements.txt
-    
-    # 启动后端服务
-    uvicorn supervisor_agent.main:app --reload
-
-后端服务将运行在 `http://localhost:8000`。
-您可以访问 `http://localhost:8000/docs` 查看交互式 API 接口文档。
-
-### 3. 构建本地知识库 (可选)
-
-如果需要 RAG 检索功能，请提前导入您的 LaTeX 语料库：
-
-    python ingest_latex.py /path/to/your/latex/files
-
-### 4. 启动前端 (Next.js)
-
-新开一个终端窗口，进入前端目录：
-
-    cd frontend
-    npm install
-    npm run dev
-    # 或 yarn dev / pnpm dev
-
-前端服务将运行在 `http://localhost:3000`。在浏览器中打开即可开始体验流式论文生成。
+`supervisor-agent/artifacts/` is created at runtime and is gitignored.
 
 ---
+
+## Environment Variables
+
+### Backend (`supervisor-agent/.env`)
+
+| Var | Required | Notes |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | yes | Any OpenAI-compatible key. |
+| `OPENAI_BASE_URL` | optional | Override for DeepSeek / SiliconFlow / Kimi / local proxies. Empty = default OpenAI endpoint. |
+| `OPENAI_MODEL` | optional | Defaults to `gpt-4-turbo-preview`. Set to `deepseek-chat`, `gpt-4o-mini`, etc. |
+| `HOST` | optional | Defaults to `0.0.0.0`. |
+| `PORT` | optional | Defaults to `8000`. |
+| `LOG_LEVEL` | optional | Defaults to `INFO`. |
+
+A template lives at `supervisor-agent/.env.example`. Never commit the real `.env`.
+
+### Frontend (`frontend/.env.local`)
+
+| Var | Required | Notes |
+| --- | --- | --- |
+| `NEXT_PUBLIC_API_BASE_URL` | optional | Backend base URL. Defaults to `http://localhost:8000`. |
+
+---
+
+## Installation
+
+### Backend
+
+```bash
+cd supervisor-agent
+
+python -m venv .venv
+# Linux / macOS
+source .venv/bin/activate
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+
+pip install -r requirements.txt
+
+cp .env.example .env
+# edit .env and fill in OPENAI_API_KEY (and optional BASE_URL / MODEL)
+
+uvicorn src.supervisor_agent.main:app --reload
+```
+
+The API will be served on `http://localhost:8000` (`/docs` for OpenAPI).
+
+### Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+The UI runs on `http://localhost:3000`. If your backend is on a non-default host, create `frontend/.env.local` with `NEXT_PUBLIC_API_BASE_URL=...`.
+
+---
+
+## RAG / Knowledge Base
+
+- The knowledge base is a local **ChromaDB** PersistentClient stored in `chroma_db/` (gitignored).
+- `supervisor-agent/ingest_latex.py` is an offline script that ingests LaTeX files:
+  - strips `\begin{document}` preamble and comments,
+  - chunks on LaTeX-aware separators (`\section`, `\subsection`, `\subsubsection`, paragraph, line),
+  - tags each chunk with metadata `{ source, section, level }` so retrieval can be scoped per section title.
+- The Researcher node retrieves top-k chunks per outline section heading, optionally biased by user-provided keywords.
+- The Writer node receives the retrieved snippets as evidence and is prompted to emit `[source: filename]` markers when leaning on them.
+- The Reviewer node sees the same evidence and checks for missing or fabricated source tags as part of its critique.
+
+The `[source: filename]` tag is a **MVP-grade traceability hint**, not a formal citation system. There is no BibTeX/APA/GB-T formatting, deduplication, or reference list generation.
+
+---
+
+## Usage Flow
+
+1. Open the UI, enter `topic`, `word_count`, optional `keywords` (comma-separated), and `max_revisions`.
+2. Click **生成大纲** — outline streams in.
+3. Either type free-text feedback and **提交修改意见** to revise the outline, or click **确认并撰写** to lock it in.
+4. Full paper streams section-by-section. Reviewer may trigger surgical rewrites of individual sections; the rest is skipped.
+5. When `final_paper` arrives, the streamed draft is replaced with the clean final version, and the artifact is persisted to `supervisor-agent/artifacts/{task_id}/`.
+6. Click **下载 Markdown** to save the file, or open any past paper from the **历史生成** list in the left sidebar.
+7. Refreshing the page restores the history list from the backend.
+
+---
+
+## API Summary
+
+All endpoints are under the FastAPI app exposed by `supervisor-agent/src/supervisor_agent/main.py`.
+
+### Generation (SSE)
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| POST | `/api/generate_outline` | Stream initial outline. |
+| POST | `/api/revise_outline` | Stream revised outline given user feedback. |
+| POST | `/api/confirm_and_write` | Run the full pipeline; emits `status`, `content`, `final_paper` (with `task_id` + `download_url`), and `done` events. |
+
+### Artifacts
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/api/artifacts` | List saved artifacts, sorted by `created_at` desc. |
+| GET | `/api/artifacts/{task_id}` | Return `metadata.json` for a single task. |
+| GET | `/api/artifacts/{task_id}/content` | Return `{ task_id, text }` (final paper Markdown body). |
+| GET | `/api/artifacts/{task_id}/download` | Download `final_paper.md` as a file. |
+
+### Misc
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/health` | Liveness probe. |
+| GET | `/` | Root info JSON. |
+| POST | `/agent/process` | Legacy non-streaming agent entry. |
+
+`task_id` must be a strict UUIDv4. Bad format returns `400`; missing artifact returns `404`.
+
+---
+
+## Artifact Storage
+
+```txt
+supervisor-agent/artifacts/
+└── {task_id}/
+    ├── final_paper.md
+    └── metadata.json
+```
+
+`metadata.json` carries `task_id`, `created_at`, `status`, `topic`, `word_count`, `keywords`, `language`, `max_revisions`. The list endpoint always overrides `task_id`, `download_url`, and `content_url` based on the directory name, so tampered metadata cannot redirect URLs.
+
+`artifacts/` is **local single-machine storage** and is gitignored. Treat it as ephemeral / per-developer.
+
+---
+
+## Known Limitations
+
+- No user system, auth, or multi-tenant isolation.
+- No background task queue (Celery / Redis); generation runs in-request through the SSE response lifetime.
+- No database — artifacts live on the local filesystem.
+- No formal citation manager — `[source: filename]` tags are MVP traceability hints, not BibTeX/APA/GB-T citations.
+- No PDF or LaTeX export — output is plain Markdown only.
+- Reviewer is LLM-judged; there is no deterministic fact-checker, no structured fact set, and no scoring rubric beyond the prompt and Pydantic schema validation.
+- `final_paper` SSE payload includes the entire paper string. There is no incremental patching for very large papers.
+- Word-count enforcement is best-effort via prompting and per-section budgets; the model may still drift.
+- Artifacts list is unpaginated.
+- LaTeX ingestion expects well-formed `\section{}` style sources; arbitrary PDFs are out of scope.
+
+---
+
+## Roadmap
+
+- Citation manager with deduplication, anchor IDs, and a generated reference list.
+- BibTeX import + LaTeX/PDF export pipeline.
+- User-uploaded reference materials per task.
+- Persistent task index in SQLite/Postgres so artifact listing does not depend on filesystem scan.
+- Background queue (Celery + Redis) so long-running generations survive disconnects.
+- Stronger Reviewer with deterministic validation passes (structure check, section-budget check, source-tag presence check).
+- Configurable retrieval — multi-query expansion, reranker, per-section keyword overrides.
+- Multi-language paper output and prompt packs.
+
+---
+
+## Development Notes
+
+- All UI strings are currently zh-CN; the underlying schema accepts a `language` field (defaults to `"zh"`).
+- The frontend assumes a single-tenant local backend at `NEXT_PUBLIC_API_BASE_URL`. CORS in `main.py` is wide open (`allow_origins=["*"]`) for dev convenience.
+- `CLAUDE.md` at the repo root documents project-specific AI coding rules (think first, simplicity first, surgical changes, goal-driven execution).
+
+---
+
+## License
+
+No license file is present yet. Until one is added, treat the code as **all rights reserved** by the repository owner.

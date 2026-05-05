@@ -15,7 +15,7 @@ import re
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, APIConnectionError, APITimeoutError, RateLimitError
 
 from supervisor_agent.config import settings
 from supervisor_agent.rag import query_similar
@@ -44,6 +44,37 @@ def _model() -> str:
 def _get_queue(config: RunnableConfig) -> asyncio.Queue | None:
     """Extract the streaming queue from LangGraph config, if present."""
     return (config.get("configurable") or {}).get("queue")
+
+
+async def _call_llm_with_retry(
+    client: AsyncOpenAI,
+    *,
+    model: str,
+    messages: list[dict],
+    stream: bool = False,
+    timeout: float = 300,
+    max_retries: int = 3,
+) -> Any:
+    """Call LLM with exponential backoff retry for transient network errors.
+
+    Only retries on connection, timeout, and rate-limit errors.
+    Streaming calls are retried only if no tokens have been yielded yet.
+    """
+    last_exception: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            return await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=stream,
+                timeout=timeout,
+            )
+        except (APIConnectionError, APITimeoutError, RateLimitError) as e:
+            last_exception = e
+            wait = 2 ** attempt  # 1s, 2s, 4s
+            logger.warning(f"[LLM] attempt {attempt + 1}/{max_retries} failed: {e}. Retrying in {wait}s...")
+            await asyncio.sleep(wait)
+    raise last_exception  # type: ignore[misc]
 
 
 # ─────────────────────────────────────────────
@@ -206,8 +237,9 @@ async def researcher_node(state: dict, config: RunnableConfig) -> dict:
     all_chunks: list[dict] = []
     seen_texts: set[str] = set()
 
+    keyword_text = " ".join(state.get("keywords") or [])
     for sec_title in sections:
-        query = f"{topic} {sec_title}"
+        query = f"{topic} {sec_title} {keyword_text}".strip()
         chunks = await asyncio.to_thread(
             query_similar, query, 3, None, with_metadata=True,
         )
@@ -238,18 +270,64 @@ async def researcher_node(state: dict, config: RunnableConfig) -> dict:
 # ─────────────────────────────────────────────
 
 def _chunks_for_section(rag_chunks: list[dict], section_title: str) -> str:
-    """Filter and format RAG chunks relevant to a section."""
+    """Filter and format RAG chunks relevant to a section, with source metadata."""
+    if not rag_chunks:
+        return ""
+
     relevant = []
     for c in rag_chunks:
         meta = c.get("metadata", {})
-        # Include if section metadata matches or if no section metadata
         sec = meta.get("section", "")
         if not sec or section_title.lower() in sec.lower() or sec.lower() in section_title.lower():
-            relevant.append(c["text"])
+            relevant.append(c)
     # If nothing matched by section, use all chunks
     if not relevant:
-        relevant = [c["text"] for c in rag_chunks[:5]]
-    return "\n\n".join(f"[参考片段]\n{t}" for t in relevant[:5])
+        relevant = rag_chunks[:5]
+
+    lines = []
+    for i, c in enumerate(relevant[:5], 1):
+        meta = c.get("metadata", {})
+        source = meta.get("source", "unknown")
+        section = meta.get("section", "unknown")
+        text = c.get("text", "")
+        lines.append(
+            f"[Reference {i}]\nsource: {source}\nsection: {section}\ntext:\n{text}"
+        )
+
+    return "\n\n".join(lines)
+
+
+def _format_evidence_chunks_for_section(
+    section_title: str,
+    rag_chunks: list[dict],
+    limit: int = 5,
+    max_chars: int = 1200,
+) -> str:
+    """Filter and format RAG chunks as evidence for Reviewer, with source metadata."""
+    if not rag_chunks:
+        return "No RAG evidence available for this section."
+
+    relevant = []
+    for c in rag_chunks:
+        meta = c.get("metadata", {})
+        sec = meta.get("section", "")
+        if not sec or section_title.lower() in sec.lower() or sec.lower() in section_title.lower():
+            relevant.append(c)
+
+    if not relevant:
+        relevant = rag_chunks[:limit]
+
+    lines = []
+    for i, c in enumerate(relevant[:limit], 1):
+        meta = c.get("metadata", {})
+        source = meta.get("source", "unknown")
+        section = meta.get("section", "unknown")
+        text = c.get("text", "")[:max_chars]
+        lines.append(
+            f"[Evidence {i}]\nsource: {source}\nsection: {section}\ntext:\n{text}"
+        )
+
+    return "\n\n".join(lines)
 
 
 async def writer_node(state: dict, config: RunnableConfig) -> dict:
@@ -321,7 +399,10 @@ async def writer_node(state: dict, config: RunnableConfig) -> dict:
         context_parts.append(
             "请撰写本章节内容，使用 Markdown 格式。"
             "不要使用 ```markdown 等代码块标记包裹你的回答，直接输出纯文本的 Markdown 正文即可"
-            "必须基于参考资料论述，保持学术严谨性。直接输出正文。"
+            "必须基于参考资料论述，保持学术严谨性。直接输出正文。\n\n"
+            "引用约束：当段落中的关键论断基于参考资料时，请在相关句子或段落末尾标注 [source: 文件名]。"
+            "只能使用 Reference 列表中真实出现过的 source，禁止编造 source。"
+            "如果本节没有可用参考资料，请明确写出「本节缺少可用参考资料」，不要伪造引用。"
         )
 
         section_prompt = "\n\n".join(context_parts)
@@ -395,25 +476,36 @@ async def reviewer_node(state: dict, config: RunnableConfig) -> dict:
     full_draft = state.get("full_draft", "")
     sections = state.get("sections", [])
     revision_count = state.get("revision_count", 0)
+    rag_chunks = state.get("rag_chunks", []) or []
+
+    # Build per-section evidence packs for Reviewer
+    section_evidence = []
+    for i, sec_title in enumerate(sections):
+        evidence = _format_evidence_chunks_for_section(sec_title, rag_chunks)
+        section_evidence.append(f"## Section {i}: {sec_title}\n{evidence}")
+
+    evidence_text = "\n\n".join(section_evidence) if section_evidence else "No RAG evidence available."
 
     # Build section list hint so the LLM knows the indices
     section_list = "\n".join(f"  {i}: {t}" for i, t in enumerate(sections))
 
     prompt = (
         "你是一个极其严苛、极度挑剔的学术盲审专家！你的KPI是必须对文章进行极其严格的挑刺。\n\n"
-        f"## 核心参考资料（请对照查验是否瞎编）\n{ref_texts}\n\n"
-        f"## 章节列表（section_idx从0开始）\n{section_list}\n\n"
-        f"## 论文草稿\n{full_draft[:20000]}\n\n" #放宽截断，让它看完
+        f"## 核心参考资料（请对照查验是否瞎编）\n{evidence_text}\n\n"
+        f"## 章节列表（section_idx 从 0 开始）\n{section_list}\n\n"
+        f"## 论文草稿\n{full_draft[:20000]}\n\n"
         "## 审查绝对死命令\n"
         "1. 逐章审查：找出逻辑最差、废话最多、或脱离参考资料瞎编的章节！\n"
         "2. 【强制打回】：如果论文质量平庸，你【必须】让至少 1-2 个最差的章节 is_valid = false，并给出极其尖锐的 feedback（不超过50字）！如果你全部给 true，将被视为严重失职！\n"
-        "3. 只有当文章真的无懈可击时，才允许 is_pass = true。\n\n"
+        "3. 检查 Writer 是否对关键论断添加了 [source: filename] 标记；是否使用了不存在于 evidence 中的 source；是否整节没有任何 source tag。\n"
+        "4. 只有当文章真的无懈可击时，才允许 is_pass = true。\n\n"
         "请严格按照以下 JSON Schema 输出：\n"
         f"```json\n{_REVIEW_SCHEMA_HINT}\n```"
     )
 
     client = _get_client()
-    resp = await client.chat.completions.create(
+    resp = await _call_llm_with_retry(
+        client,
         model=_model(),
         messages=[{"role": "user", "content": prompt}],
         timeout=300,
@@ -437,12 +529,17 @@ async def reviewer_node(state: dict, config: RunnableConfig) -> dict:
         if not review_pass:
             for sr in result.section_reviews:
                 if not sr.is_valid and sr.feedback:
-                    section_feedbacks[sr.section_idx] = sr.feedback
+                    if 0 <= sr.section_idx < len(sections):
+                        section_feedbacks[sr.section_idx] = sr.feedback
+                    else:
+                        logger.warning(
+                            f"[Reviewer] ignoring out-of-bound section_idx: {sr.section_idx}"
+                        )
     except Exception as e:
         logger.warning(f"[Reviewer] failed to parse review JSON: {e}")
         review_pass = True  # Don't block on parse failure
         review_dict = {"is_pass": True, "section_reviews": []}
-    
+
     revision_count += 1
 
     # Build review feedback message for the SSE stream
@@ -463,10 +560,15 @@ async def reviewer_node(state: dict, config: RunnableConfig) -> dict:
     if queue:
         await queue.put({"type": "content", "text": review_msg})
         await queue.put({"type": "review", "result": review_dict})
-# 如果审查通过，或者已经达到了最大重试次数上限（生成结束了）
-        max_rev = state.get("max_revisions", 2)
-        if review_pass or revision_count >= max_rev:
-            await queue.put({"type": "final_paper", "text": full_draft})
+
+    # Push final_paper when review passes or max revisions reached
+    max_rev = state.get("max_revisions", 2)
+    should_finish = review_pass or revision_count >= max_rev
+    if should_finish and queue:
+        clean_final = re.sub(r"^```(markdown|md)?\s*", "", full_draft, flags=re.IGNORECASE)
+        clean_final = re.sub(r"\s*```\s*$", "", clean_final)
+        await queue.put({"type": "final_paper", "text": clean_final})
+
     logger.info(f"[Reviewer] pass={review_pass}, revision_count={revision_count}, "
                 f"failed_sections={list(section_feedbacks.keys())}")
 
