@@ -2,7 +2,7 @@
 
 ## Code Style
 
-This project follows the guidelines in [`.github/instructions/CLAUDE.instructions.md`](../.github/instructions/CLAUDE.instructions.md).
+This project follows the guidelines in [`CLAUDE.md`](../../CLAUDE.md).
 
 Key principles:
 1. **Think Before Coding** - State assumptions, surface tradeoffs
@@ -13,8 +13,10 @@ Key principles:
 ## Development Setup
 
 1. Clone the repository
-2. Create a virtual environment: `python -m venv venv`
-3. Activate it: `source venv/bin/activate`
+2. Create a virtual environment: `python -m venv .venv`
+3. Activate it:
+   - Linux/Mac: `source .venv/bin/activate`
+   - Windows: `.venv\Scripts\Activate.ps1`
 4. Install dev dependencies: `pip install -e ".[dev]"`
 
 ## Running Tests
@@ -50,4 +52,4 @@ black src tests && isort src tests && ruff check src tests && mypy src && pytest
 
 ## Questions?
 
-Refer to the coding instructions in `.github/instructions/CLAUDE.instructions.md`
+Refer to the coding instructions in [`CLAUDE.md`](../../CLAUDE.md)

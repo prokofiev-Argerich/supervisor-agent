@@ -1,36 +1,53 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Frontend
 
-## Getting Started
+supervisor_AGENT 的 Next.js 前端,提供论文生成交互界面。
 
-First, run the development server:
+## 快速开始
 
 ```bash
+cd frontend
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+访问 http://localhost:3000
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## 后端地址配置
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+默认连接 `http://localhost:8000`。如果后端运行在其他地址,创建 `.env.local`:
 
-## Learn More
+```
+NEXT_PUBLIC_API_BASE_URL=http://your-backend:8000
+```
 
-To learn more about Next.js, take a look at the following resources:
+## 交互流程
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+1. 输入研究主题、字数上限、可选关键词 → 点击「生成大纲」
+2. 预览大纲,可选择:
+   - 输入修改意见 → 「提交修改意见」→ 修订大纲 (可反复)
+   - 「确认并撰写」→ RAG 检索 → 逐节撰写 → 审查 → 局部重写 → 全文输出
+3. 历史论文可在左侧列表查看和下载
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## 技术栈
 
-## Deploy on Vercel
+- Next.js 16 (App Router)
+- React 19 + TypeScript (strict)
+- Tailwind CSS v4
+- shadcn/ui (base-nova)
+- react-markdown
+- framer-motion
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## 项目结构
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```
+frontend/
+├── app/
+│   ├── layout.tsx      # 根布局
+│   ├── page.tsx         # 主页面: SSE 消费 + 历史面板 + Markdown 渲染
+│   └── globals.css      # Tailwind + shadcn 变量
+├── components/
+│   └── ui/              # shadcn/ui 原子组件
+├── lib/
+│   └── utils.ts         # cn() 工具
+└── package.json
+```

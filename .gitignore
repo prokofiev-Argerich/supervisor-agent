@@ -13,6 +13,10 @@ venv/
 # ChromaDB
 chroma_db/
 
+# Generated paper artifacts
+artifacts/
+supervisor-agent/artifacts/
+
 # Node
 node_modules/
 .next/
@@ -29,3 +33,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local AI rules
+CLAUDE.md

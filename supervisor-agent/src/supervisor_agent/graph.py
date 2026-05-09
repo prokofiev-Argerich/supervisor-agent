@@ -37,7 +37,6 @@ def _should_revise(state: dict) -> str:
     if state.get("review_pass", False):
         return "end"
 
-    # 👇 必须动态读取状态里的数字，绝不能用写死的 MAX_REVISIONS！
     max_rev = state.get("max_revisions", 2) 
 
     if state.get("revision_count", 0) >= max_rev:

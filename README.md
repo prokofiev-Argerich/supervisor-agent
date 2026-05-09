@@ -1,129 +1,170 @@
-# Supervisor Agent
+# supervisor_AGENT
 
-面向严肃学术长文调研与生成场景的端到端闭环 AI 系统。
+基于 **FastAPI + LangGraph** 的 Agentic RAG 长文生成系统。输入主题和字数,自动完成大纲规划、知识库检索、逐节撰写、审查修订,输出结构化 Markdown 论文。
 
-AI 负责文献检索、长文起草与格式排版；用户（Human-in-the-loop）负责全局大纲确认、修改意见反馈与核心研究方向定调。基于 FastAPI + LangGraph 构建，支持大纲生成、人工动态修订、RAG 检索增强和流式（SSE）全文撰写。
+> 研究型 MVP,非生产系统。演示端到端 Agent+RAG 流水线的完整闭环。
 
----
+## 特性
 
-## 💡 核心设计与特性
+- **大纲生成与修订** — 根据主题自动生成大纲,支持人工反馈反复修订
+- **RAG 增强检索** — ChromaDB 本地向量库,按章节标题检索 LaTeX 知识片段
+- **流式逐节撰写** — SSE 实时推送,滑动窗口保持章节间连贯性
+- **审查-局部重写** — Reviewer 结构化审查,仅重写不合格章节,跳过已通过的
+- **来源标注** — `[source: 文件名]` 标记,可追溯引用来源
+- **历史管理** — 产物持久化,支持查看、恢复、下载历史论文
+- **多模型兼容** — OpenAI / DeepSeek / SiliconFlow / Kimi 等兼容 API
 
-### 1. 多节点状态流转编排 (LangGraph)
-弃用黑盒框架，采用 LangGraph 状态机编排执行流程，拆分为四大核心节点：
-* **Planner（规划）：** 根据用户主题生成结构化大纲，支持接收反馈并动态重构大纲。
-* **Researcher（检索）：** 基于确认后的大纲调用 RAG 检索知识库，精确召回相关文献片段。
-* **Writer（撰写）：** 携带检索上下文逐章撰写，动态滑动窗口截断历史，解决长文本 Token 爆炸与注意力涣散。
-* **Reviewer（审稿）：** 采用 Pydantic 结构化约束的审查节点，拦截虚假引用，锚定文献真实性。
+## 架构
 
-### 2. 人机协同工作流 (Human-in-the-loop)
-引入大纲修订循环机制。用户在生成长文前，可对 AI 生成的初始大纲提出具体的修改意见（如“第三章拆成两节”、“增加文献综述章节”），系统将结合历史大纲与反馈重新规划，直到用户满意后才触发高成本的全文撰写与检索。
+```mermaid
+flowchart LR
+    subgraph FE[Frontend - Next.js 16]
+        UI[app/page.tsx]
+    end
 
-### 3. 代码级语义切块 (LaTeX RAG)
-创新性抛弃常规 PDF 解析，基于 LaTeX 原生标签（`\section`、`\subsection`）实现语义切块。元数据（章节层级、标题）强绑定至 ChromaDB 向量条目，检索精度远超朴素文本分割。
+    subgraph BE[Backend - FastAPI]
+        API[/SSE 流式端点/]
+        AGT[SupervisorAgent]
+    end
 
-### 4. 流式交互架构 (SSE)
-基于 FastAPI 异步路由与 SSE 单向流式通信，打造丝滑的前端打字机体验。
+    subgraph GR[LangGraph Pipeline]
+        direction LR
+        P[Planner] --> R[Researcher]
+        R --> W[Writer]
+        W --> RV[Reviewer]
+        RV -- 需修改 --> W
+        RV -- 通过 --> AGT
+    end
 
----
+    subgraph DATA[存储]
+        CH[(ChromaDB)]
+        ART[(artifacts/)]
+    end
 
-## 🏗️ 架构概览
+    LLM{{OpenAI 兼容 LLM}}
 
-    ┌─────────────────────────────────────────────────────────┐
-    │  Frontend (Next.js)                                     │
-    │  app/page.tsx — SSE 流式交互界面                         │
-    │                                                         │
-    │  用户流程:                                               │
-    │  输入主题 → 生成大纲 → [输入修改意见 ↔ 重新生成大纲] → 确认撰写 │
-    └────────────────────────┬────────────────────────────────┘
-                             │ HTTP + SSE
-    ┌────────────────────────▼────────────────────────────────┐
-    │  Backend (FastAPI)                                      │
-    │                                                         │
-    │  API 端点:                                               │
-    │    POST /api/generate_outline  — 初次生成大纲            │
-    │    POST /api/revise_outline    — 根据反馈修订大纲         │
-    │    POST /api/confirm_and_write — 确认大纲并执行 RAG 撰写  │
-    └────────────────────────┬────────────────────────────────┘
-                             │
-    ┌────────────────────────▼────────────────────────────────┐
-    │  Agent & LangGraph 编排层 (agent.py / graph.py)           │
-    │                                                         │
-    │  outline_graph:  Planner 规划初始大纲                     │
-    │  revise_graph:   Planner 接收 feedback 重构大纲           │
-    │  paper_graph:    Researcher → Writer → Reviewer         │
-    └─────────────────────────────────────────────────────────┘
+    UI -- POST + SSE --> API --> AGT --> GR
+    R <--> CH
+    GR <--> LLM
+    AGT --> ART
+    UI --> ART
+```
 
----
+## 快速开始
 
-## 📂 项目结构
+### 后端
 
-    supervisor-agent/
-    ├── src/supervisor_agent/
-    │   ├── main.py              # FastAPI 入口，路由定义与 SSE 流生成
-    │   ├── agent.py             # SupervisorAgent，调度各个 Graph
-    │   ├── graph.py             # LangGraph 工作流图构建
-    │   ├── nodes.py             # 各节点业务逻辑（规划/修订/检索/撰写/校对）
-    │   ├── state.py             # 全局状态定义（PaperState，包含 feedback 字段）
-    │   ├── rag.py               # RAG 向量检索与 ChromaDB 交互
-    │   ├── config.py            # 环境变量与配置管理
-    │   ├── ingest_latex.py      # 知识库构建脚本（LaTeX 语义解析入库）
-    │   └── schemas/             # Pydantic 数据验证模型
-    │       ├── paper.py         # 包含 ReviseRequest 等请求模型
-    │       └── review.py        # 审稿与排版相关模型
-    ├── frontend/                # Next.js 交互前端
-    │   ├── app/page.tsx         # 主页面（主题输入/大纲预览/反馈弹窗/全文展示）
-    │   └── components/ui/       # shadcn/ui 组件库
-    └── .env.example             # 环境变量配置模板
+```bash
+cd supervisor-agent
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+cp .env.example .env         # 填入 OPENAI_API_KEY
+uvicorn src.supervisor_agent.main:app --reload
+```
 
----
+API: `http://localhost:8000` | 文档: `http://localhost:8000/docs`
 
-## 🚀 快速开始
+### 前端
 
-### 1. 环境准备与配置
+```bash
+cd frontend
+npm install
+npm run dev                   # http://localhost:3000
+```
 
-在项目根目录复制环境变量模板并填入您的配置：
+后端非默认地址时创建 `frontend/.env.local`: `NEXT_PUBLIC_API_BASE_URL=http://...`
 
-    cp .env.example .env
+### 构建知识库
 
-**关键环境变量说明：**
+```bash
+cd supervisor-agent
+python ingest_latex.py <latex_目录>
+```
 
-| 变量 | 说明 |
-| :--- | :--- |
-| `OPENAI_API_KEY` | 您的 API 密钥（必填） |
-| `OPENAI_BASE_URL` | 自定义 API 代理地址（可选，兼容 DeepSeek / Ollama 等兼容协议服务） |
-| `OPENAI_MODEL` | 使用的模型名称，默认推荐 `gpt-4-turbo-preview` |
-| `LOG_LEVEL` | 日志级别，默认 `INFO` |
+## 环境变量
 
-### 2. 启动后端 (FastAPI)
+`supervisor-agent/.env`:
 
-建议使用 Python 3.11+ 虚拟环境：
+| 变量 | 必需 | 默认值 | 说明 |
+|---|---|---|---|
+| `OPENAI_API_KEY` | 是 | — | API 密钥 |
+| `OPENAI_BASE_URL` | 否 | OpenAI | 兼容端点地址 |
+| `OPENAI_MODEL` | 否 | `gpt-4-turbo-preview` | 模型名 |
+| `HOST` | 否 | `0.0.0.0` | 监听地址 |
+| `PORT` | 否 | `8000` | 监听端口 |
+| `LOG_LEVEL` | 否 | `INFO` | 日志级别 |
 
-    cd supervisor-agent
-    python -m venv venv
-    source venv/bin/activate     # Windows 用户请使用: venv\Scripts\activate
-    pip install -e ".[dev]"      # 或 pip install -r requirements.txt
-    
-    # 启动后端服务
-    uvicorn supervisor_agent.main:app --reload
+## API
 
-后端服务将运行在 `http://localhost:8000`。
-您可以访问 `http://localhost:8000/docs` 查看交互式 API 接口文档。
+所有 SSE 端点返回 `status / content / final_paper / error / done` 事件。
 
-### 3. 构建本地知识库 (可选)
+| Method | Path | 说明 |
+|---|---|---|
+| POST | `/api/generate_outline` | 流式生成大纲 |
+| POST | `/api/revise_outline` | 流式修订大纲 |
+| POST | `/api/confirm_and_write` | 全流程: 检索→撰写→审查→局部重写 |
+| GET | `/api/artifacts` | 历史列表 |
+| GET | `/api/artifacts/{id}` | 产物元数据 |
+| GET | `/api/artifacts/{id}/content` | 论文正文 |
+| GET | `/api/artifacts/{id}/download` | 下载 Markdown |
+| GET | `/health` | 健康检查 |
 
-如果需要 RAG 检索功能，请提前导入您的 LaTeX 语料库：
+## 使用流程
 
-    python ingest_latex.py /path/to/your/latex/files
+1. 输入**主题** + **字数上限** + 可选关键词 → 点击「生成大纲」
+2. 预览大纲,可输入修改意见反复修订
+3. 确认后进入全流程: 知识库检索 → 逐节撰写 → 审查 → 局部重写
+4. 最终论文实时流式输出,支持下载和历史回顾
 
-### 4. 启动前端 (Next.js)
+## 项目结构
 
-新开一个终端窗口，进入前端目录：
+```
+supervisor_AGENT/
+├── frontend/                   # Next.js 16 + React 19 + Tailwind v4
+│   └── app/page.tsx            # 单页 UI + SSE 消费 + 历史面板
+│
+├── supervisor-agent/           # FastAPI + LangGraph 后端
+│   ├── src/supervisor_agent/
+│   │   ├── main.py             # 入口 + 全部路由
+│   │   ├── agent.py            # LangGraph 驱动器 + SSE 队列
+│   │   ├── graph.py            # 3 个 StateGraph 构建器
+│   │   ├── nodes.py            # Planner / Revise / Researcher / Writer / Reviewer
+│   │   ├── state.py            # PaperState TypedDict
+│   │   ├── rag.py              # ChromaDB 检索封装
+│   │   ├── artifacts.py        # 产物持久化
+│   │   └── schemas/            # Pydantic 请求/响应模型
+│   └── ingest_latex.py         # 离线 LaTeX 入库脚本
+│
+└── CLAUDE.md                   # AI 编码规范
+```
 
-    cd frontend
-    npm install
-    npm run dev
-    # 或 yarn dev / pnpm dev
+## 技术栈
 
-前端服务将运行在 `http://localhost:3000`。在浏览器中打开即可开始体验流式论文生成。
+| 层级 | 技术 |
+|---|---|
+| 前端 | Next.js 16, React 19, TypeScript, Tailwind v4, shadcn/ui, react-markdown |
+| 后端 | FastAPI, LangGraph, LangChain, AsyncOpenAI |
+| 向量库 | ChromaDB (PersistentClient) + OpenAI Embedding |
+| 存储 | 本地文件系统 (`artifacts/{task_id}/`) |
+| 模型 | GPT-4 / DeepSeek / SiliconFlow / Kimi 等 OpenAI 兼容 API |
 
----
+## 已知限制
+
+- 无用户系统与认证,单租户本地运行
+- 生成在请求线程内执行,无后台队列,断开 SSE 即终止
+- `[source:]` 标注为 MVP 级溯源,非正式引用格式
+- Reviewer 为 LLM 自审,无确定性事实校验
+- 产物列表无分页,超大论文无增量补丁
+
+## 路线图
+
+- 引用管理器: 去重、锚点 ID、自动生成参考文献列表
+- 后台任务队列: Celery + Redis,生成与请求生命周期解耦
+- 确定性审查增强: 字数/结构/来源标注的正则校验
+- PDF/LaTeX 导出, BibTeX 导入
+- 可配置检索策略: 多查询扩展、重排序、按章节关键词覆盖
+
+## License
+
+MIT
